@@ -1,0 +1,97 @@
+import axios from "axios";
+import authService from "../services/authService";
+
+const httpClient = axios.create({
+  baseURL: process.env.REACT_APP_API_URL || "http://localhost:5000/api",
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+
+httpClient.interceptors.request.use(
+  (config) => {
+    const token = authService.getToken();
+    if (token) {
+      config.headers["Authorization"] = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+
+  failedQueue = [];
+};
+
+httpClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then((token) => {
+            originalRequest.headers["Authorization"] = "Bearer " + token;
+            return httpClient(originalRequest);
+          })
+          .catch((err) => {
+            return Promise.reject(err);
+          });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const refreshResult = await authService.refreshToken();
+
+        if (refreshResult) {
+          const token = authService.getToken();
+
+          if (!token) {
+            throw new Error("Failed to get token after refresh");
+          }
+
+          originalRequest.headers["Authorization"] = `Bearer ${token}`;
+
+          processQueue(null, token);
+
+          return httpClient(originalRequest);
+        } else {
+          throw new Error("Token refresh failed");
+        }
+      } catch (refreshError) {
+        console.error("Token refresh error:", refreshError);
+
+        processQueue(refreshError, null);
+
+        authService.logout();
+        window.location.href = "/login";
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default httpClient;
